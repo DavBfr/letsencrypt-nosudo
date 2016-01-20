@@ -1,9 +1,16 @@
 #!/usr/bin/env python
 import argparse, subprocess, json, os, urllib2, sys, base64, binascii, time, \
-    hashlib, tempfile, re, copy, textwrap
+    hashlib, tempfile, re, copy, textwrap, BaseHTTPServer, threading
+
+def http_server(data, port):
+    http_server_running = True
+    h = BaseHTTPServer.BaseHTTPRequestHandler;
+    h.do_GET = lambda r: r.send_response(200) or r.end_headers() or r.wfile.write(data);
+    s = BaseHTTPServer.HTTPServer(('0.0.0.0', port), h);
+    s.handle_request()
 
 
-def sign_csr(pubkey, csr, email=None, file_based=False):
+def sign_csr(pubkey, csr, private_key=None, http_port=80, email=None, file_based=False):
     """Use the ACME protocol to get an ssl certificate signed by a
     certificate authority.
 
@@ -161,7 +168,8 @@ def sign_csr(pubkey, csr, email=None, file_based=False):
     csr_file_sig_name = os.path.basename(csr_file_sig.name)
 
     # Step 5: Ask the user to sign the registration and requests
-    sys.stderr.write("""\
+    if not private_key:
+        sys.stderr.write("""\
 STEP 2: You need to sign some files (replace 'user.key' with your user private key).
 
 openssl dgst -sha256 -sign user.key -out {0} {1}
@@ -169,14 +177,31 @@ openssl dgst -sha256 -sign user.key -out {0} {1}
 openssl dgst -sha256 -sign user.key -out {3} {4}
 
 """.format(
-    reg_file_sig_name, reg_file_name,
-    "\n".join("openssl dgst -sha256 -sign user.key -out {0} {1}".format(i['sig_name'], i['file_name']) for i in ids),
-    csr_file_sig_name, csr_file_name))
+        reg_file_sig_name, reg_file_name,
+        "\n".join("openssl dgst -sha256 -sign user.key -out {0} {1}".format(i['sig_name'], i['file_name']) for i in ids),
+        csr_file_sig_name, csr_file_name))
 
-    stdout = sys.stdout
-    sys.stdout = sys.stderr
-    raw_input("Press Enter when you've run the above commands in a new terminal window...")
-    sys.stdout = stdout
+        stdout = sys.stdout
+        sys.stdout = sys.stderr
+        raw_input("Press Enter when you've run the above commands in a new terminal window...")
+        sys.stdout = stdout
+    else:
+        proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", private_key, "-out", reg_file_sig_name, reg_file_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise IOError("Error signing {0}".format(reg_file_name) + out + err)
+        for i in ids:
+            proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", private_key, "-out", i['sig_name'], i['file_name']],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                raise IOError("Error signing {0}".format(i['file_name']))
+        proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", private_key, "-out", csr_file_sig_name, csr_file_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise IOError("Error signing {0}".format(csr_file_name))
 
     # Step 6: Load the signatures
     reg_file_sig.seek(0)
@@ -271,19 +296,27 @@ openssl dgst -sha256 -sign user.key -out {3} {4}
         })
 
     # Step 9: Ask the user to sign the challenge responses
-    sys.stderr.write("""\
+    if not private_key:
+        sys.stderr.write("""\
 STEP 3: You need to sign some more files (replace 'user.key' with your user private key).
 
 {0}
 
 """.format(
-    "\n".join("openssl dgst -sha256 -sign user.key -out {0} {1}".format(
-        i['sig_name'], i['file_name']) for i in tests)))
+        "\n".join("openssl dgst -sha256 -sign user.key -out {0} {1}".format(
+            i['sig_name'], i['file_name']) for i in tests)))
 
-    stdout = sys.stdout
-    sys.stdout = sys.stderr
-    raw_input("Press Enter when you've run the above commands in a new terminal window...")
-    sys.stdout = stdout
+        stdout = sys.stdout
+        sys.stdout = sys.stderr
+        raw_input("Press Enter when you've run the above commands in a new terminal window...")
+        sys.stdout = stdout
+    else:
+        for i in tests:
+            proc = subprocess.Popen(["openssl", "dgst", "-sha256", "-sign", private_key, "-out", i['sig_name'], i['file_name']],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                raise IOError("Error signing {0}".format(i['file_name']))
 
     # Step 10: Load the response signatures
     for n, i in enumerate(ids):
@@ -311,22 +344,26 @@ Notes:
             sys.stdout = sys.stderr
             raw_input("Press Enter when you've got the file hosted on your server...")
             sys.stdout = stdout
-        else:
+        elif http_port <= 1024:
             sys.stderr.write("""\
 STEP {0}: You need to run this command on {1} (don't stop the python command until the next step).
 
 sudo python -c "import BaseHTTPServer; \\
     h = BaseHTTPServer.BaseHTTPRequestHandler; \\
     h.do_GET = lambda r: r.send_response(200) or r.end_headers() or r.wfile.write('{2}'); \\
-    s = BaseHTTPServer.HTTPServer(('0.0.0.0', 80), h); \\
+    s = BaseHTTPServer.HTTPServer(('0.0.0.0', {3}), h); \\
     s.serve_forever()"
 
-""".format(n + 4, i['domain'], responses[n]['data']))
+""".format(n + 4, i['domain'], responses[n]['data'], http_port))
 
             stdout = sys.stdout
             sys.stdout = sys.stderr
             raw_input("Press Enter when you've got the python command running on your server...")
             sys.stdout = stdout
+        else:
+            sys.stderr.write("Starting webserver on port {0}\n".format(http_port))
+            th = threading.Thread(target=http_server, args=(responses[n]['data'], http_port))
+            th.start()
 
         # Step 12: Let the CA know you're ready for the challenge
         sys.stderr.write("Requesting verification for {0}...\n".format(i['domain']))
@@ -438,11 +475,13 @@ $ python sign_csr.py --public-key user.pub domain.csr > signed.crt
 
 """)
     parser.add_argument("-p", "--public-key", required=True, help="path to your account public key")
+    parser.add_argument("--private-key", required=False, help="path to your account private key")
+    parser.add_argument("--http-port", required=False, type=int, help="http port for acme-challange requests")
     parser.add_argument("-e", "--email", default=None, help="contact email, default is webmaster@<shortest_domain>")
     parser.add_argument("-f", "--file-based", action='store_true', help="if set, a file-based response is used")
     parser.add_argument("csr_path", help="path to your certificate signing request")
 
     args = parser.parse_args()
-    signed_crt = sign_csr(args.public_key, args.csr_path, email=args.email, file_based=args.file_based)
+    signed_crt = sign_csr(args.public_key, args.csr_path, private_key=args.private_key, http_port=args.http_port, email=args.email, file_based=args.file_based)
     sys.stdout.write(signed_crt)
 
